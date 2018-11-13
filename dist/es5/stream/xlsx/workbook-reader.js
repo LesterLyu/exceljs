@@ -21,6 +21,8 @@ var WorkbookPropertiesManager = require('../../xlsx/xform/book/workbook-properti
 var WorksheetReader = require('./worksheet-reader');
 var HyperlinkReader = require('./hyperlink-reader');
 
+var Temp = require('temp');
+
 var WorkbookReader = module.exports = function (options) {
   this.options = options = options || {};
 
@@ -40,6 +42,9 @@ var WorkbookReader = module.exports = function (options) {
 
   // end of stream check
   this.atEnd = false;
+
+  Temp.track();
+  this.waitingWorkSheets = [];
 };
 
 utils.inherits(WorkbookReader, events.EventEmitter, {
@@ -75,6 +80,7 @@ utils.inherits(WorkbookReader, events.EventEmitter, {
 
     zip.on('entry', function (entry) {
       var match, sheetNo;
+      // console.log(entry.path);
       switch (entry.path) {
         case '_rels/.rels':
         case 'xl/_rels/workbook.xml.rels':
@@ -93,7 +99,13 @@ utils.inherits(WorkbookReader, events.EventEmitter, {
           if (entry.path.match(/xl\/worksheets\/sheet\d+[.]xml/)) {
             match = entry.path.match(/xl\/worksheets\/sheet(\d+)[.]xml/);
             sheetNo = match[1];
-            _this._parseWorksheet(entry, sheetNo, options);
+            if (_this.sharedStrings) {
+              _this._parseWorksheet(entry, sheetNo, options);
+            } else {
+              var stream = Temp.createWriteStream();
+              _this.waitingWorkSheets.push({ sheetNo: sheetNo, options: options, path: stream.path });
+              entry.pipe(stream);
+            }
           } else if (entry.path.match(/xl\/worksheets\/_rels\/sheet\d+[.]xml.rels/)) {
             match = entry.path.match(/xl\/worksheets\/_rels\/sheet(\d+)[.]xml.rels/);
             sheetNo = match[1];
@@ -106,10 +118,41 @@ utils.inherits(WorkbookReader, events.EventEmitter, {
     });
 
     zip.on('close', function () {
-      _this.emit('end');
-      _this.atEnd = true;
-      if (!_this.readers) {
-        _this.emit('finished');
+      var self = _this;
+      if (_this.waitingWorkSheets.length) {
+        var currentBook = 0;
+
+        var processBooks = function processBooks() {
+          var worksheetInfo = self.waitingWorkSheets[currentBook];
+          var entry = fs.createReadStream(worksheetInfo.path);
+
+          var sheetNo = worksheetInfo.sheetNo;
+          var options = worksheetInfo.options;
+          var worksheet = self._parseWorksheet(entry, sheetNo, options);
+
+          worksheet.on('finished', function (node) {
+            ++currentBook;
+            if (currentBook == self.waitingWorkSheets.length) {
+              Temp.cleanupSync();
+              // setImmediate(this.emit.bind(this), 'finished');
+
+              self.emit('end');
+              self.atEnd = true;
+              if (!self.readers) {
+                self.emit('finished');
+              }
+            } else {
+              setImmediate(processBooks);
+            }
+          });
+        };
+        setImmediate(processBooks);
+      } else {
+        _this.emit('end');
+        _this.atEnd = true;
+        if (!_this.readers) {
+          _this.emit('finished');
+        }
       }
     });
 
@@ -206,6 +249,7 @@ utils.inherits(WorkbookReader, events.EventEmitter, {
       this.emit('worksheet', worksheetReader);
     }
     worksheetReader.read(entry, options, this.hyperlinkReaders[sheetNo]);
+    return worksheetReader;
   },
   _parseHyperlinks: function _parseHyperlinks(entry, sheetNo, options) {
     this._emitEntry(options, { type: 'hyerlinks', id: sheetNo });
